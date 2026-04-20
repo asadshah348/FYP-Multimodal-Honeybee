@@ -1,6 +1,6 @@
-# Bee Acoustic Activity Index (AAI) CLI Tool
+# Bee Band Energy Monitor CLI Tool
 
-Estimate relative bee population trends from audio recordings using acoustic feature analysis.
+Track bee hive acoustic activity over time by measuring bee-frequency sound energy from audio recordings.
 
 ## Setup
 
@@ -28,7 +28,7 @@ Results are appended to `data/aai_log.csv`.
 
 ### View trend chart
 
-Display the AAI trend chart:
+Display the Band Energy trend chart:
 
 ```bash
 python aai.py chart
@@ -42,14 +42,17 @@ python aai.py chart --output chart.png
 
 ## How It Works
 
-The tool extracts four acoustic features from each recording:
+The tool extracts two acoustic features from each recording:
 
-- **RMS Energy** — overall signal amplitude
-- **Band Energy** — energy in the 200–600 Hz bee-relevant frequency band
-- **Bioacoustic Index (BI)** — mean spectral power in the bee band
-- **Activity Ratio** — fraction of audio frames with signal above the noise floor
+- **RMS Energy** — overall sound amplitude of the entire recording
+- **Band Energy** — sound energy filtered to the 200–600 Hz range where bee wing vibrations and buzzing occur; the primary activity indicator
 
-These are combined into a single **composite AAI score** (0–1 scale) that tracks relative colony activity over time. The trend chart shows this score with a rolling average and threshold bands for stable / declining / critical states.
+### Trend Chart
+
+The chart plots Band Energy (and RMS for context) over all recordings with:
+
+- **Baseline** — mean Band Energy across all healthy recordings (outlier drops below the alert threshold are excluded so they don't distort the reference level)
+- **Alert threshold** — 70% of the baseline; any recording falling below this line is flagged with a ⚠ Low annotation, indicating unusually low bee activity
 
 ## Project Structure
 
@@ -57,7 +60,7 @@ These are combined into a single **composite AAI score** (0–1 scale) that trac
 FYP/
   audio/              # place bee audio files here
   data/
-    aai_log.csv       # auto-created, stores all AAI results
+    aai_log.csv       # auto-created, stores all results
   aai.py              # main CLI script
   requirements.txt    # Python dependencies
   README.md           # this file
