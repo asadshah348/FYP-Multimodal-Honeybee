@@ -1,0 +1,230 @@
+# Multimodal Honeybee Hive Monitoring System
+
+> **Final Year Project — Ghulam Ishaq Khan Institute of Engineering Sciences and Technology (GIKI)**  
+> Team of 3 · 2025–2026
+
+A real-time, edge-deployed system for non-invasive honeybee hive health monitoring. It combines **computer vision** (bee counting via YOLOv11) and **acoustic analysis** (BeeCNN audio classifier + band-energy CLI) on an **NVIDIA Jetson Orin Nano**, presenting everything through a unified **Flask web dashboard** with **AWS S3** cloud persistence.
+
+---
+
+## Table of Contents
+
+- [System Overview](#system-overview)
+- [Architecture](#architecture)
+- [Components](#components)
+- [Hardware](#hardware)
+- [Project Structure](#project-structure)
+- [Setup & Installation](#setup--installation)
+- [Running the System](#running-the-system)
+- [Cloud Storage](#cloud-storage)
+- [Component Documentation](#component-documentation)
+
+---
+
+## System Overview
+
+Traditional hive inspection requires opening the hive, which stresses the colony. This system monitors the hive passively using two modalities:
+
+| Modality | Method | Output |
+|---|---|---|
+| **Visual** | YOLOv11 object detection via Roboflow | Bee count per frame |
+| **Acoustic (CNN)** | BeeCNN mel-spectrogram classifier | Activity level, swarm risk, estimated count |
+| **Acoustic (CLI)** | Band-energy measurement (200–600 Hz) | RMS & band energy trend over time |
+
+Fusing both modalities gives a more complete picture of hive health than either sensor alone.
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────┐
+│                 NVIDIA Jetson Orin Nano              │
+│                                                     │
+│  ┌──────────────┐    ┌──────────────────────────┐   │
+│  │  CSI / USB   │    │  Microphone (USB / I2S)  │   │
+│  │   Camera     │    │                          │   │
+│  └──────┬───────┘    └────────────┬─────────────┘   │
+│         │                         │                  │
+│  ┌──────▼───────┐    ┌────────────▼─────────────┐   │
+│  │  CV Module   │    │    Audio Module           │   │
+│  │  (YOLOv11)   │    │  BeeCNN + AAI CLI         │   │
+│  └──────┬───────┘    └────────────┬─────────────┘   │
+│         │                         │                  │
+│  ┌──────▼─────────────────────────▼─────────────┐   │
+│  │          Flask Web Dashboard                  │   │
+│  │              (final_jetson.py)                │   │
+│  └──────────────────────────┬────────────────────┘   │
+└─────────────────────────────┼───────────────────────┘
+                              │
+                   ┌──────────▼──────────┐
+                   │      AWS S3         │
+                   │  (history, alerts,  │
+                   │   dashboard stats)  │
+                   └─────────────────────┘
+```
+
+---
+
+## Components
+
+### 1. Computer Vision — Bee Counter
+- **Model:** YOLOv11 hosted on Roboflow (two separate workspaces for image inference and real-time video workflows)
+- **Inputs:** single image upload, video upload, live CSI/USB camera feed, burst capture mode
+- **Output:** annotated image/frame with bounding boxes + bee count
+- **Alerts:** triggered when count exceeds 250 (high activity) or drops to 0 (no bees detected)
+- [Full CV documentation →](computer-vision/README.md)
+
+### 2. Audio CNN — BeeCNN Classifier
+- **Model:** custom 3-layer CNN (`BeeCNN`) operating on 128-bin mel spectrograms
+- **Input:** 3-second, 16 kHz mono WAV clips
+- **Output:** activity level (Very Low → Extreme Swarm), estimated bee count, swarming probability, stress level, anomaly flag
+- **Live capture:** PyAudio (primary) or `arecord` (Jetson fallback)
+- [Full Audio CNN documentation →](audio-cnn/README.md)
+
+### 3. Acoustic Activity Indicator (AAI) — CLI Tool
+- **Script:** `aai.py` — a standalone command-line tool
+- **Features:** RMS energy and 200–600 Hz band energy extraction, CSV logging, trend chart with alert threshold
+- **Use case:** longitudinal tracking of hive acoustic health over days/weeks without needing the full dashboard
+- [Full AAI documentation →](aai/README.md)
+
+---
+
+## Hardware
+
+| Component | Details |
+|---|---|
+| **Edge AI Board** | NVIDIA Jetson Orin Nano |
+| **Camera** | CSI camera (primary) · USB webcam (fallback) |
+| **Microphone** | USB microphone · I2S mic (Jetson fallback via `arecord`) |
+| **OS** | JetPack (Ubuntu 20.04-based) |
+
+---
+
+## Project Structure
+
+```
+FYP-Multimodal-Honeybee/
+│
+├── final_jetson.py          # Main Flask application (CV + Audio + Dashboard)
+├── aai.py                   # Standalone acoustic activity indicator CLI
+├── requirements.txt         # Python dependencies
+│
+├── audio/                   # Sample WAV recordings for AAI testing
+├── data/
+│   └── aai_log.csv          # Auto-generated by aai.py
+│
+├── computer-vision/
+│   └── README.md            # CV component documentation
+├── audio-cnn/
+│   └── README.md            # BeeCNN component documentation
+├── aai/
+│   └── README.md            # AAI CLI tool documentation
+│
+├── uploads/                 # Temp folder — uploaded images
+├── results/                 # Temp folder — annotated result images
+├── audio_uploads/           # Temp folder — uploaded/recorded audio
+├── video_uploads/           # Temp folder — uploaded videos
+└── captures/                # Temp folder — camera captures
+```
+
+> **Note:** `uploads/`, `results/`, `audio_uploads/`, `video_uploads/`, and `captures/` are created automatically at runtime and are not committed to version control.
+
+---
+
+## Setup & Installation
+
+### Prerequisites
+
+- Python 3.10+
+- NVIDIA Jetson Orin Nano with JetPack installed (or any Ubuntu machine for PC testing)
+- `ffmpeg` installed system-wide (for video processing)
+
+```bash
+sudo apt install ffmpeg
+```
+
+### Python Dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+For the full dashboard (`final_jetson.py`), additional packages are required:
+
+```bash
+pip install flask inference-sdk boto3 torch torchvision librosa opencv-python pyaudio
+```
+
+> On Jetson, use the JetPack-provided PyTorch wheel for CUDA support instead of the PyPI version.
+
+### Model File
+
+Place your trained BeeCNN weights at the project root:
+
+```
+FYP-Multimodal-Honeybee/
+└── bee_audio_model.pth      ← required for audio CNN inference
+```
+
+If this file is absent, the audio module falls back to a deterministic hash-based analyser (no GPU/model required, but results are illustrative only).
+
+---
+
+## Running the System
+
+### Full Dashboard (Jetson / PC)
+
+```bash
+python final_jetson.py
+```
+
+Then open `http://<device-ip>:5000` in a browser. The dashboard provides:
+
+- Live camera feed with real-time bee detection
+- Image, video, and audio upload + analysis
+- Detection history charts
+- Alert feed (pulled from AWS S3)
+- Dashboard statistics
+
+### Standalone AAI CLI
+
+```bash
+# Analyze a single recording
+python aai.py analyze audio/sample.wav --label "Day 1"
+
+# Analyze all WAV files in a folder
+python aai.py analyze audio/
+
+# View the band-energy trend chart
+python aai.py chart
+
+# Save chart to a file
+python aai.py chart --output hive_trend.png
+```
+
+---
+
+## Cloud Storage
+
+All persistent data is stored in an **AWS S3 bucket** (`honeybee-fyp-2026`, region `ap-south-1`):
+
+| S3 Key | Contents |
+|---|---|
+| `data/detection_history.json` | CV detection log (bee counts, timestamps, source) |
+| `data/audio_history.json` | Audio analysis log (level, swarm probability, anomaly flag) |
+| `data/alerts.json` | System alert feed |
+| `data/dashboard_stats.json` | Cumulative dashboard counters |
+| `images/` | Annotated result images |
+
+The dashboard loads history and alerts live from S3, so data persists across restarts and is accessible from any device.
+
+---
+
+## Component Documentation
+
+| Component | Documentation |
+|---|---|
+| Computer Vision (YOLOv11) | [computer-vision/README.md](computer-vision/README.md) |
+| Audio CNN (BeeCNN) | [audio-cnn/README.md](audio-cnn/README.md) |
+| Acoustic Activity Indicator CLI | [aai/README.md](aai/README.md) |
