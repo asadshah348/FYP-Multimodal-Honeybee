@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 .env
 results/
+audio_uploads/
+captures/
+uploads/
+video_uploads/

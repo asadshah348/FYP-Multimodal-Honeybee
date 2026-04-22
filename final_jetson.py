@@ -71,10 +71,18 @@ AUDIO_HISTORY_S3_KEY = "data/audio_history.json"
 ALERTS_S3_KEY = "data/alerts.json"
 DASHBOARD_STATS_S3_KEY = "data/dashboard_stats.json"
 
-# Roboflow Client
+# Roboflow Clients
+# `client` (workspace: asad-fnvcs) — used for IMAGE uploads only
 client = InferenceHTTPClient(
     api_url="https://serverless.roboflow.com",
     api_key="cSTL1ItPm98da1Y3USmT"
+)
+
+# `realtime_client` (workspace: team-yolo) — used for LIVE webcam polling and
+# video-frame inference via HTTP run_workflow.
+realtime_client = InferenceHTTPClient(
+    api_url="https://serverless.roboflow.com",
+    api_key="OkvGCd6FNLzoqkyEJ29k"
 )
 
 # ============================================================
@@ -95,6 +103,7 @@ s3_client = boto3.client(
     aws_access_key_id=AWS_ACCESS_KEY,
     aws_secret_access_key=AWS_SECRET_KEY,
     region_name=AWS_REGION
+
 )
 
 # ============================================================
@@ -205,14 +214,27 @@ def increment_dashboard_stats(captures=0, audio_samples=0, videos_processed=0, t
         save_json_to_s3(DASHBOARD_STATS_S3_KEY, stats)
         return stats
 
+# Known dummy alerts from an earlier build — purged from S3 on startup.
+_DUMMY_ALERT_MESSAGES = {
+    "Node Topi-01 deployed in Topi, KPK",
+    "Node Ghazi-02 deployed in Ghazi, KPK",
+    "Swarm event detected on Node Topi-01",
+    "Low battery warning on Node Ghazi-02",
+}
+
 def init_test_data():
-    """Seed alerts for test locations if empty"""
+    """Clean any pre-existing dummy alerts from S3 and log a real device-online
+    alert for this startup."""
     alerts = load_json_from_s3(ALERTS_S3_KEY)
-    if not alerts:
-        add_alert("Device Online", "Node Topi-01 deployed in Topi, KPK", "info")
-        add_alert("Device Online", "Node Ghazi-02 deployed in Ghazi, KPK", "info")
-        add_alert("Swarm Detection", "Swarm event detected on Node Topi-01", "critical")
-        add_alert("Low Battery", "Low battery warning on Node Ghazi-02", "warning")
+    cleaned = [a for a in alerts if a.get("message") not in _DUMMY_ALERT_MESSAGES]
+    if len(cleaned) != len(alerts):
+        save_json_to_s3(ALERTS_S3_KEY, cleaned)
+
+    add_alert(
+        "Device Online",
+        f"BeeDetect AI started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "info",
+    )
 
 # ============================================================
 # JETSON HARDWARE CONFIGURATION
@@ -225,7 +247,8 @@ CAPTURE_FPS = 30
 # Audio settings
 AUDIO_SAMPLE_RATE = 16000
 AUDIO_CHANNELS = 1
-AUDIO_DURATION = 3  # seconds
+AUDIO_DURATION = 3            # default duration for legacy callers
+AUDIO_MAX_DURATION = 20       # hard cap for user-controlled recording
 
 # Jetson CSI Camera GStreamer pipeline
 def get_jetson_gstreamer_pipeline(
@@ -255,6 +278,15 @@ camera_lock = threading.Lock()
 is_capturing = False
 current_frame = None
 audio_recording_process = None
+
+# Live WebRTC detection state (server-side)
+live_session = None                # {"active": bool} sentinel
+live_capture_thread = None         # thread that keeps pulling raw frames from the camera
+live_inference_thread = None       # thread that sends frames to Roboflow and publishes annotations
+latest_raw_frame = None            # np.ndarray of the most recent camera frame (unannotated)
+latest_annotated_frame = None      # np.ndarray of the latest Roboflow-annotated frame
+latest_live_count = 0              # latest bee count from Roboflow
+live_session_lock = threading.Lock()
 
 # ============================================================
 # REAL AUDIO MODEL - BeeCNN
@@ -342,7 +374,7 @@ def get_bee_level_and_range(probs):
 def predict_audio(file_path):
     """Run real audio prediction with BeeCNN. Deterministic: same audio → same output."""
     if not AUDIO_MODEL_LOADED:
-        return generate_fallback_audio_analysis(os.path.basename(file_path))
+        return generate_fallback_audio_analysis(file_path)
 
     x = extract_mel(file_path).to(device)
     with torch.no_grad():
@@ -387,11 +419,30 @@ def predict_audio(file_path):
     }
 
 
-def generate_fallback_audio_analysis(filename):
-    """Fallback deterministic audio analysis when model not loaded"""
-    hash_obj = hashlib.md5(filename.encode())
-    hash_int = int(hash_obj.hexdigest(), 16)
-    get_val = lambda key, min_v, max_v: min_v + (int(hashlib.md5((filename + key).encode()).hexdigest(), 16) % (max_v - min_v + 1))
+def _hash_audio_identifier(path_or_name):
+    """Build a stable identifier from the audio content so re-uploads of the
+    same file — regardless of the server-side timestamped filename — produce
+    the same fallback result. Falls back to hashing the name string if the
+    path doesn't exist or can't be read."""
+    if os.path.exists(path_or_name) and os.path.isfile(path_or_name):
+        try:
+            h = hashlib.md5()
+            with open(path_or_name, "rb") as f:
+                for chunk in iter(lambda: f.read(65536), b""):
+                    h.update(chunk)
+            return h.hexdigest()
+        except Exception as e:
+            print(f"audio content hash failed ({e}); falling back to name hash")
+    return hashlib.md5(str(path_or_name).encode()).hexdigest()
+
+
+def generate_fallback_audio_analysis(path_or_name):
+    """Fallback deterministic audio analysis when model not loaded.
+    Uses a hash derived from the audio *content* so identical audio — uploaded
+    any number of times with any filename — always produces the same result.
+    Also keeps estimated_count inside the reported bee_range."""
+    identifier = _hash_audio_identifier(path_or_name)
+    get_val = lambda key, min_v, max_v: min_v + (int(hashlib.md5((identifier + key).encode()).hexdigest(), 16) % (max_v - min_v + 1))
 
     activity = get_val("_activity", 40, 95)
     classifications = ['Normal Hive', 'Swarming Risk', 'Queenless']
@@ -400,7 +451,6 @@ def generate_fallback_audio_analysis(filename):
     stress_index = get_val("_stress", 0, 2)
     swarming_prob = get_val("_swarm", 5, 85)
     anomaly_detected = bool(get_val("_anomaly", 0, 1) == 1)
-    estimated_count = int(activity * 1.2)
 
     frequency_data = []
     for i in range(20):
@@ -414,6 +464,17 @@ def generate_fallback_audio_analysis(filename):
         bee_range = "600 - 1000"
     else:
         bee_range = "30 - 100"
+
+    # Deterministic estimated_count inside the predicted range — keep it
+    # between 20% and 80% of the span so it doesn't hug the bounds.
+    if '-' in bee_range:
+        parts = bee_range.split('-')
+        r_start = int(parts[0].strip())
+        r_end = int(parts[1].strip().replace('+', ''))
+        position = get_val("_pos", 20, 80) / 100.0
+        estimated_count = int(round(r_start + (r_end - r_start) * position))
+    else:
+        estimated_count = int(bee_range.replace('+', '').strip())
 
     return {
         "level": level,
@@ -540,6 +601,132 @@ def generate_camera_feed():
 # ============================================================
 # JETSON AUDIO FUNCTIONS
 # ============================================================
+
+# Shared state for user-stoppable recording. The background thread writes
+# into this dict; the HTTP handlers start/stop and read `path` after.
+recording_state = {
+    "active": False,
+    "thread": None,
+    "path": None,
+    "process": None,         # arecord subprocess (when PyAudio is unavailable)
+}
+recording_lock = threading.Lock()
+
+
+def _recording_worker(output_path, max_duration):
+    """Background worker: records audio frames until `active` goes False OR
+    max_duration is reached, whichever comes first. Always writes a valid WAV
+    to `output_path` on exit."""
+    if PYAUDIO_AVAILABLE:
+        p = pyaudio.PyAudio()
+        frames = []
+        stream = None
+        try:
+            stream = p.open(
+                format=pyaudio.paInt16,
+                channels=AUDIO_CHANNELS,
+                rate=AUDIO_SAMPLE_RATE,
+                input=True,
+                frames_per_buffer=1024,
+            )
+            max_chunks = int(AUDIO_SAMPLE_RATE / 1024 * max_duration)
+            read_chunks = 0
+            print(f"Recording up to {max_duration} seconds (stoppable)...")
+            while recording_state["active"] and read_chunks < max_chunks:
+                try:
+                    data = stream.read(1024, exception_on_overflow=False)
+                    frames.append(data)
+                    read_chunks += 1
+                except Exception as e:
+                    print(f"Recording read error: {e}")
+                    break
+        finally:
+            if stream is not None:
+                try: stream.stop_stream()
+                except Exception: pass
+                try: stream.close()
+                except Exception: pass
+            p.terminate()
+
+        # Always write whatever we got so the analyzer has something to work with
+        if not frames:
+            # fall back to a short silent clip so downstream code doesn't choke
+            frames = [b"\x00" * 2048]
+        wf = wave.open(output_path, "wb")
+        wf.setnchannels(AUDIO_CHANNELS)
+        wf.setsampwidth(2)  # int16
+        wf.setframerate(AUDIO_SAMPLE_RATE)
+        wf.writeframes(b"".join(frames))
+        wf.close()
+    else:
+        # arecord fallback — record for up to max_duration, terminate early if asked
+        try:
+            proc = subprocess.Popen([
+                "arecord",
+                "-D", "plughw:1,0",
+                "-d", str(max_duration),
+                "-r", str(AUDIO_SAMPLE_RATE),
+                "-c", str(AUDIO_CHANNELS),
+                "-f", "S16_LE",
+                output_path,
+            ])
+            recording_state["process"] = proc
+            while recording_state["active"] and proc.poll() is None:
+                time.sleep(0.1)
+            if proc.poll() is None:
+                proc.terminate()
+                try: proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            recording_state["process"] = None
+        except (FileNotFoundError, Exception) as e:
+            print(f"arecord unavailable ({e}); creating synthetic audio")
+            create_test_tone(output_path, 3)
+
+    recording_state["active"] = False
+
+
+def start_recording(output_path, max_duration=AUDIO_MAX_DURATION):
+    """Kick off a background recording. Returns True on success, False if
+    something is already recording."""
+    with recording_lock:
+        if recording_state["active"] or (
+            recording_state["thread"] is not None and recording_state["thread"].is_alive()
+        ):
+            return False
+        recording_state["active"] = True
+        recording_state["path"] = output_path
+        t = threading.Thread(
+            target=_recording_worker,
+            args=(output_path, max_duration),
+            daemon=True,
+        )
+        recording_state["thread"] = t
+        t.start()
+    return True
+
+
+def stop_recording(wait_timeout=6.0):
+    """Signal the recording worker to stop and wait until it has flushed the
+    WAV file. Returns the output path, or None if nothing was recording."""
+    with recording_lock:
+        if not recording_state["active"] and not (
+            recording_state["thread"] is not None and recording_state["thread"].is_alive()
+        ):
+            return None
+        recording_state["active"] = False
+        # If arecord is mid-flight, terminate it so we don't wait the full -d duration
+        proc = recording_state.get("process")
+        if proc is not None and proc.poll() is None:
+            try: proc.terminate()
+            except Exception: pass
+
+    t = recording_state.get("thread")
+    if t is not None:
+        t.join(timeout=wait_timeout)
+    return recording_state.get("path")
+
+
 def record_audio_jetson(duration=AUDIO_DURATION, output_path=None):
     """Record audio from microphone on Jetson"""
     if output_path is None:
@@ -619,130 +806,200 @@ def create_test_tone(output_path, duration=3, frequency=200):
 # ============================================================
 # VIDEO PROCESSING FUNCTIONS
 # ============================================================
-def process_video_file(video_path, output_path=None, frame_interval=5):
+def sanitize_video(input_path):
     """
-    Process uploaded video: extract frames, run detection, aggregate results.
-    frame_interval: process every Nth frame to speed up inference
+    Re-encode uploaded video to a clean H.264/yuv420p mp4 so OpenCV's FFmpeg
+    decoder stops emitting 'mmco: unref short failure' warnings and returns
+    consistent frames. Returns the fixed path, or the original if ffmpeg
+    is missing / the re-encode fails.
     """
-    if output_path is None:
-        timestamp = int(time.time())
-        output_path = os.path.join(VIDEO_UPLOAD_FOLDER, f"output_{timestamp}.mp4")
+    try:
+        base, _ = os.path.splitext(input_path)
+        fixed_path = f"{base}_sanitized.mp4"
+        subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-err_detect", "ignore_err",
+                "-i", input_path,
+                "-c:v", "libx264",
+                "-preset", "veryfast",
+                "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+                "-an",  # strip audio, not used
+                "-loglevel", "error",
+                fixed_path,
+            ],
+            check=True,
+            timeout=600,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if os.path.exists(fixed_path) and os.path.getsize(fixed_path) > 0:
+            return fixed_path
+    except FileNotFoundError:
+        print("ffmpeg not found, skipping video sanitization")
+    except subprocess.CalledProcessError as e:
+        print(f"ffmpeg re-encode failed (return code {e.returncode}), using original")
+    except Exception as e:
+        print(f"Video sanitize skipped: {e}")
+    return input_path
 
-    cap = cv2.VideoCapture(video_path)
+
+NUM_VIDEO_FRAMES = 5  # Evenly-spaced frames sampled from each uploaded video
+
+
+def process_video_file(video_path):
+    """
+    Split the uploaded video into NUM_VIDEO_FRAMES evenly-spaced frames,
+    run each frame through the Roboflow workflow (team-yolo), and upload
+    ONLY the annotated output frames to AWS S3. The raw source video is
+    NOT uploaded. Returns a summary dict with per-frame results (count,
+    timestamp, S3 URL, inline base64 preview) for the frontend gallery.
+    """
+    # Re-encode for clean seeking on weird codecs; no-op if ffmpeg missing
+    sanitized_path = sanitize_video(video_path)
+
+    cap = cv2.VideoCapture(sanitized_path)
     if not cap.isOpened():
+        if sanitized_path != video_path and os.path.exists(sanitized_path):
+            try: os.remove(sanitized_path)
+            except OSError: pass
         return None, "Failed to open video file"
 
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    duration = (total_frames / fps) if fps > 0 else 0
 
-    # Video writer for output
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    if total_frames < 1:
+        cap.release()
+        if sanitized_path != video_path and os.path.exists(sanitized_path):
+            try: os.remove(sanitized_path)
+            except OSError: pass
+        return None, "Video has no readable frames"
+
+    # Pick frames at 10%, 30%, 50%, 70%, 90% of the video
+    positions = [0.10, 0.30, 0.50, 0.70, 0.90]
+    frame_indices = [
+        max(0, min(total_frames - 1, int(total_frames * p))) for p in positions
+    ]
+
+    timestamp = int(time.time())
+    s3_folder = f"video/processed/{timestamp}"
 
     frame_results = []
-    frame_count = 0
-    processed_count = 0
     total_bees = 0
-    max_bees_in_frame = 0
-    peak_frame = 0
+    max_bees = 0
+    peak_position = 0
 
-    while True:
+    for i, frame_idx in enumerate(frame_indices):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
         ret, frame = cap.read()
-        if not ret:
-            break
+        if not ret or frame is None:
+            frame_results.append({
+                "position": i + 1,
+                "frame_index": int(frame_idx),
+                "timestamp": round(frame_idx / fps, 2) if fps else 0,
+                "bee_count": 0,
+                "s3_url": None,
+                "raw_base64": None,
+                "annotated_base64": None,
+                "error": "Could not read frame",
+            })
+            continue
 
-        # Process every Nth frame
-        if frame_count % frame_interval == 0:
-            # Save temp frame for inference
-            temp_frame_path = os.path.join(CAPTURE_FOLDER, f"vid_frame_{frame_count}.jpg")
-            cv2.imwrite(temp_frame_path, frame)
+        temp_path = os.path.join(
+            CAPTURE_FOLDER, f"video_{timestamp}_frame_{i + 1}.jpg"
+        )
+        cv2.imwrite(temp_path, frame)
 
-            try:
-                result = client.run_workflow(
-                    workspace_name="asad-fnvcs",
-                    workflow_id="detect-count-and-visualize-2",
-                    images={"image": temp_frame_path},
-                    use_cache=True
+        # Encode the raw (before) frame as base64 for the frontend before/after view
+        raw_b64 = None
+        try:
+            ok, raw_buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            if ok:
+                raw_b64 = base64.b64encode(raw_buf.tobytes()).decode("utf-8")
+        except Exception as e:
+            print(f"Raw frame encode error: {e}")
+
+        bee_count = 0
+        annotated_b64 = None
+        s3_url = None
+        error = None
+
+        try:
+            result = realtime_client.run_workflow(
+                workspace_name="team-yolo",
+                workflow_id="detect-count-and-visualize-2",
+                images={"image": temp_path},
+                use_cache=True,
+            )
+            data = result[0] if result else {}
+            bee_count = int(data.get("count_objects", 0) or 0)
+            annotated_b64 = data.get("output_image")
+
+            if annotated_b64:
+                # Write the annotated frame to disk so we can upload it to S3
+                annotated_path = os.path.join(
+                    RESULT_FOLDER, f"annotated_{timestamp}_frame_{i + 1}.jpg"
                 )
-                data = result[0]
-                bee_count = data.get("count_objects", 0)
-                output_image_base64 = data.get("output_image", None)
+                try:
+                    with open(annotated_path, "wb") as f:
+                        f.write(base64.b64decode(annotated_b64))
+                    # Upload ONLY the annotated frame — the original video is NOT uploaded
+                    s3_url = upload_to_s3(
+                        annotated_path,
+                        f"frame_{i + 1}.jpg",
+                        folder=s3_folder,
+                    )
+                finally:
+                    if os.path.exists(annotated_path):
+                        try: os.remove(annotated_path)
+                        except OSError: pass
+        except Exception as e:
+            error = str(e)
+            print(f"Video frame {i + 1} inference error: {e}")
+        finally:
+            if os.path.exists(temp_path):
+                try: os.remove(temp_path)
+                except OSError: pass
 
-                # Decode output image if available
-                if output_image_base64:
-                    output_bytes = base64.b64decode(output_image_base64)
-                    nparr = np.frombuffer(output_bytes, np.uint8)
-                    output_frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                    if output_frame is not None:
-                        # Resize to match original if needed
-                        if output_frame.shape[:2] != (height, width):
-                            output_frame = cv2.resize(output_frame, (width, height))
-                        out.write(output_frame)
-                    else:
-                        # Annotate original frame with count
-                        annotated = frame.copy()
-                        cv2.putText(annotated, f"Bees: {bee_count}", (20, 40),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                        out.write(annotated)
-                else:
-                    annotated = frame.copy()
-                    cv2.putText(annotated, f"Bees: {bee_count}", (20, 40),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                    out.write(annotated)
+        total_bees += bee_count
+        if bee_count > max_bees:
+            max_bees = bee_count
+            peak_position = i + 1
 
-                total_bees += bee_count
-                if bee_count > max_bees_in_frame:
-                    max_bees_in_frame = bee_count
-                    peak_frame = frame_count
-
-                frame_results.append({
-                    "frame": frame_count,
-                    "bee_count": bee_count,
-                    "timestamp": round(frame_count / fps, 2)
-                })
-                processed_count += 1
-
-            except Exception as e:
-                print(f"Frame {frame_count} inference error: {e}")
-                out.write(frame)
-                frame_results.append({
-                    "frame": frame_count,
-                    "bee_count": 0,
-                    "timestamp": round(frame_count / fps, 2),
-                    "error": str(e)
-                })
-            finally:
-                if os.path.exists(temp_frame_path):
-                    os.remove(temp_frame_path)
-        else:
-            # Write original frame for non-processed frames
-            out.write(frame)
-
-        frame_count += 1
+        frame_results.append({
+            "position": i + 1,
+            "frame_index": int(frame_idx),
+            "timestamp": round(frame_idx / fps, 2) if fps else 0,
+            "bee_count": bee_count,
+            "s3_url": s3_url,
+            "raw_base64": raw_b64,
+            "annotated_base64": annotated_b64,
+            **({"error": error} if error else {}),
+        })
 
     cap.release()
-    out.release()
+    if sanitized_path != video_path and os.path.exists(sanitized_path):
+        try: os.remove(sanitized_path)
+        except OSError: pass
 
-    avg_bees = round(total_bees / processed_count, 2) if processed_count > 0 else 0
-    duration = round(total_frames / fps, 2) if fps > 0 else 0
+    processed_count = sum(1 for r in frame_results if r.get("s3_url") or r.get("annotated_base64"))
+    avg_bees = round(total_bees / len(frame_results), 2) if frame_results else 0
 
     summary = {
         "total_frames": total_frames,
         "processed_frames": processed_count,
+        "num_sampled_frames": len(frame_results),
         "fps": round(fps, 2),
-        "duration": duration,
+        "duration": round(duration, 2),
         "total_bees_detected": total_bees,
         "average_bees_per_frame": avg_bees,
-        "max_bees_in_single_frame": max_bees_in_frame,
-        "peak_frame": peak_frame,
-        "peak_timestamp": round(peak_frame / fps, 2) if fps > 0 else 0,
-        "frame_interval_used": frame_interval,
-        "frame_results": frame_results
+        "max_bees_in_single_frame": max_bees,
+        "peak_position": peak_position,
+        "frame_results": frame_results,
     }
-
-    return output_path, summary
+    return summary, None
 
 
 # ============================================================
@@ -1925,7 +2182,11 @@ HTML_TEMPLATE = """
                     <img src="/video_feed" id="cameraFeed" alt="Live Camera Feed">
                     <div class="camera-overlay">
                         <span class="status-dot"></span>
-                        LIVE
+                        <span id="liveFeedLabel">LIVE</span>
+                    </div>
+                    <div id="liveCountBadge" style="display:none; position:absolute; top:0.75rem; right:0.75rem; background: rgba(245, 158, 11, 0.95); color:#0f172a; font-weight:700; padding:0.4rem 0.75rem; border-radius:999px; box-shadow:0 2px 8px rgba(0,0,0,0.35);">
+                        <i class="fas fa-bug"></i>
+                        <span id="liveCount">0</span> bees
                     </div>
                 </div>
                 <div class="camera-controls">
@@ -1936,6 +2197,10 @@ HTML_TEMPLATE = """
                     <button class="camera-btn secondary" id="burstBtn" onclick="captureBurst()">
                         <i class="fas fa-images"></i>
                         Burst Capture (5)
+                    </button>
+                    <button class="camera-btn primary" id="liveDetectBtn" onclick="toggleLiveDetection()">
+                        <i class="fas fa-bolt"></i>
+                        Start Live Detection
                     </button>
                 </div>
             </div>
@@ -2022,9 +2287,16 @@ HTML_TEMPLATE = """
 
             <!-- CV Detection History Chart -->
             <div class="card" style="margin-bottom: 1.5rem;">
-                <div class="card-header">
-                    <i class="fas fa-chart-bar" style="color: var(--accent-primary);"></i>
-                    <h3>Detection History (from AWS)</h3>
+                <div class="section-title-row">
+                    <div class="card-header">
+                        <i class="fas fa-chart-bar" style="color: var(--accent-primary);"></i>
+                        <h3>Detection History (from AWS)</h3>
+                    </div>
+                    <div class="toggle-group">
+                        <button class="toggle-btn active" onclick="switchCVRange('daily', this)">Daily</button>
+                        <button class="toggle-btn" onclick="switchCVRange('weekly', this)">Weekly</button>
+                        <button class="toggle-btn" onclick="switchCVRange('monthly', this)">Monthly</button>
+                    </div>
                 </div>
                 <div class="chart-wrapper">
                     <canvas id="cvHistoryChart"></canvas>
@@ -2136,17 +2408,15 @@ HTML_TEMPLATE = """
                     </div>
                 </div>
 
-                <div class="card" id="videoOutputCard" style="display: none;">
+                <div class="card" id="videoFramesCard" style="display: none;">
                     <div class="card-header">
-                        <i class="fas fa-play-circle"></i>
-                        <h3>Processed Video</h3>
+                        <i class="fas fa-images"></i>
+                        <h3>Processed Frames (stored on AWS S3)</h3>
                     </div>
-                    <div class="camera-feed-wrapper">
-                        <video id="processedVideo" controls style="width: 100%; border-radius: 12px;">
-                            <source src="" type="video/mp4">
-                            Your browser does not support the video tag.
-                        </video>
-                    </div>
+                    <p style="color: var(--text-secondary); margin-bottom: 1rem; font-size: 0.9rem;">
+                        5 frames sampled evenly across the video, each annotated by Roboflow. Only the annotated outputs are uploaded to S3; the raw video is discarded.
+                    </p>
+                    <div id="videoFramesContainer"></div>
                 </div>
             </div>
         </section>
@@ -2225,7 +2495,7 @@ HTML_TEMPLATE = """
                     </div>
                     <div class="metric-row">
                         <span class="metric-label">Recording Duration</span>
-                        <span class="metric-value">3 seconds</span>
+                        <span class="metric-value">up to 20 s (user-stoppable)</span>
                     </div>
                     <div class="metric-row">
                         <span class="metric-label">Estimation Levels</span>
@@ -2313,20 +2583,6 @@ HTML_TEMPLATE = """
                     </div>
                 </div>
 
-                <div class="card" style="margin-top: 1.5rem;" id="s3AudioCard" style="display: none;">
-                    <div class="card-header">
-                        <i class="fas fa-cloud"></i>
-                        <h3>Cloud Storage</h3>
-                    </div>
-                    <div class="metric-row">
-                        <span class="metric-label">S3 URL</span>
-                        <span class="metric-value" id="audioS3Url" style="font-size: 0.8rem; word-break: break-all;">-</span>
-                    </div>
-                    <div class="metric-row">
-                        <span class="metric-label">Status</span>
-                        <span class="metric-value" style="color: var(--accent-green);">Uploaded</span>
-                    </div>
-                </div>
             </div>
 
             <!-- Audio Historical Trends -->
@@ -2353,9 +2609,16 @@ HTML_TEMPLATE = """
             <div class="cards-grid">
                 <!-- CV History -->
                 <div class="card" style="grid-column: 1 / -1;">
-                    <div class="card-header">
-                        <i class="fas fa-history" style="color: var(--accent-primary);"></i>
-                        <h3>Detection History (from AWS)</h3>
+                    <div class="section-title-row">
+                        <div class="card-header">
+                            <i class="fas fa-history" style="color: var(--accent-primary);"></i>
+                            <h3>Detection History (from AWS)</h3>
+                        </div>
+                        <div class="toggle-group">
+                            <button class="toggle-btn active" onclick="switchDashCVRange('daily', this)">Daily</button>
+                            <button class="toggle-btn" onclick="switchDashCVRange('weekly', this)">Weekly</button>
+                            <button class="toggle-btn" onclick="switchDashCVRange('monthly', this)">Monthly</button>
+                        </div>
                     </div>
                     <div class="chart-wrapper">
                         <canvas id="dashCVHistoryChart"></canvas>
@@ -2453,6 +2716,92 @@ HTML_TEMPLATE = """
 
         function hideLoading() {
             document.getElementById('loadingOverlay').classList.remove('show');
+        }
+
+        // ===== LIVE WEBRTC DETECTION =====
+        let liveDetectionActive = false;
+        let liveCountInterval = null;
+
+        function toggleLiveDetection() {
+            if (liveDetectionActive) {
+                stopLiveDetection();
+            } else {
+                startLiveDetection();
+            }
+        }
+
+        function startLiveDetection() {
+            const btn = document.getElementById('liveDetectBtn');
+            btn.disabled = true;
+            btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Starting...';
+            fetch('/start-live-detection', { method: 'POST' })
+                .then(r => r.json())
+                .then(data => {
+                    btn.disabled = false;
+                    if (data.error) {
+                        alert('Error: ' + data.error);
+                        btn.innerHTML = '<i class="fas fa-bolt"></i> Start Live Detection';
+                        return;
+                    }
+                    liveDetectionActive = true;
+                    // Swap the live feed to the annotated stream
+                    const feed = document.getElementById('cameraFeed');
+                    feed.src = '/live-feed?ts=' + Date.now();
+                    document.getElementById('liveFeedLabel').textContent = 'LIVE • DETECTING';
+                    document.getElementById('liveCountBadge').style.display = 'block';
+                    btn.innerHTML = '<i class="fas fa-stop"></i> Stop Live Detection';
+                    btn.classList.remove('primary');
+                    btn.classList.add('secondary');
+                    // Poll the count ~2x/sec
+                    liveCountInterval = setInterval(pollLiveCount, 500);
+                })
+                .catch(err => {
+                    btn.disabled = false;
+                    btn.innerHTML = '<i class="fas fa-bolt"></i> Start Live Detection';
+                    alert('Failed to start live detection: ' + err.message);
+                });
+        }
+
+        function stopLiveDetection() {
+            const btn = document.getElementById('liveDetectBtn');
+            btn.disabled = true;
+            btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Stopping...';
+            fetch('/stop-live-detection', { method: 'POST' })
+                .then(r => r.json())
+                .then(() => {
+                    liveDetectionActive = false;
+                    if (liveCountInterval) { clearInterval(liveCountInterval); liveCountInterval = null; }
+                    // Swap back to the local camera MJPEG feed
+                    const feed = document.getElementById('cameraFeed');
+                    feed.src = '/video_feed?ts=' + Date.now();
+                    document.getElementById('liveFeedLabel').textContent = 'LIVE';
+                    document.getElementById('liveCountBadge').style.display = 'none';
+                    btn.disabled = false;
+                    btn.innerHTML = '<i class="fas fa-bolt"></i> Start Live Detection';
+                    btn.classList.remove('secondary');
+                    btn.classList.add('primary');
+                    loadDashboardStats();
+                    loadAlerts();
+                })
+                .catch(err => {
+                    btn.disabled = false;
+                    btn.innerHTML = '<i class="fas fa-bolt"></i> Start Live Detection';
+                    alert('Failed to stop live detection: ' + err.message);
+                });
+        }
+
+        function pollLiveCount() {
+            fetch('/live-count')
+                .then(r => r.json())
+                .then(data => {
+                    if (!data.active) {
+                        // session ended server-side — tidy up the UI
+                        if (liveDetectionActive) stopLiveDetection();
+                        return;
+                    }
+                    document.getElementById('liveCount').textContent = data.count_objects;
+                })
+                .catch(() => {/* ignore transient errors */});
         }
 
         // Capture and detect from camera
@@ -2644,7 +2993,7 @@ HTML_TEMPLATE = """
 
         function uploadAndAnalyzeAudio() {
             if (!selectedAudioFile) return;
-            showLoading('Analyzing Audio...', 'Running BeeCNN inference and uploading to S3');
+            showLoading('Analyzing Audio...', 'Running BeeCNN inference');
 
             const formData = new FormData();
             formData.append('audio', selectedAudioFile);
@@ -2656,10 +3005,6 @@ HTML_TEMPLATE = """
                     if (data.error) { alert('Error: ' + data.error); return; }
                     displayAudioResults(data);
                     loadDashboardStats();
-                    if (data.s3_url) {
-                        document.getElementById('s3AudioCard').style.display = 'block';
-                        document.getElementById('audioS3Url').textContent = data.s3_url;
-                    }
                     loadAudioTrends('daily', 'audioTrendChart');
                 })
                 .catch(err => {
@@ -2723,21 +3068,24 @@ HTML_TEMPLATE = """
             document.getElementById('vidMaxBees').textContent = s.max_bees_in_single_frame;
             document.getElementById('vidTotalBees').textContent = s.total_bees_detected;
 
+            // Bar chart across the 5 sampled frames (replaces the line timeline)
             const ctx = document.getElementById('videoTimelineChart');
-            if (window.videoTimelineChart) window.videoTimelineChart.destroy();
-
-            window.videoTimelineChart = new Chart(ctx.getContext('2d'), {
-                type: 'line',
+            // Use a prefixed window property to avoid collision with the canvas
+            // element's DOM id (browsers expose named elements on `window`, and
+            // an HTMLCanvasElement has no `.destroy()` method).
+            if (window._videoChartInstance && typeof window._videoChartInstance.destroy === 'function') {
+                window._videoChartInstance.destroy();
+            }
+            window._videoChartInstance = new Chart(ctx.getContext('2d'), {
+                type: 'bar',
                 data: {
-                    labels: s.frame_results.map(f => f.timestamp + 's'),
+                    labels: s.frame_results.map(f => 'Frame ' + f.position + ' (' + f.timestamp + 's)'),
                     datasets: [{
-                        label: 'Bee Count',
+                        label: 'Bees Detected',
                         data: s.frame_results.map(f => f.bee_count),
+                        backgroundColor: 'rgba(245, 158, 11, 0.85)',
                         borderColor: '#f59e0b',
-                        backgroundColor: 'rgba(245, 158, 11, 0.1)',
-                        fill: true,
-                        tension: 0.4,
-                        pointRadius: 3
+                        borderWidth: 1
                     }]
                 },
                 options: {
@@ -2752,14 +3100,14 @@ HTML_TEMPLATE = """
                         },
                         x: {
                             grid: { color: '#334155' },
-                            ticks: { color: '#94a3b8', maxTicksLimit: 10 }
+                            ticks: { color: '#94a3b8' }
                         }
                     },
                     plugins: {
                         legend: { display: false },
                         title: {
                             display: true,
-                            text: 'Bee Detection Timeline',
+                            text: 'Bee Count Across 5 Sampled Frames',
                             color: '#f8fafc',
                             font: { size: 14 }
                         }
@@ -2767,17 +3115,79 @@ HTML_TEMPLATE = """
                 }
             });
 
-            if (data.output_video_base64) {
-                document.getElementById('videoOutputCard').style.display = 'block';
-                const videoEl = document.getElementById('processedVideo');
-                videoEl.src = 'data:video/mp4;base64,' + data.output_video_base64;
-                videoEl.load();
+            // Render each sampled frame as its own Original / Detected pair,
+            // matching the layout of the image-upload results card.
+            const card = document.getElementById('videoFramesCard');
+            const container = document.getElementById('videoFramesContainer');
+            if (s.frame_results && s.frame_results.length) {
+                card.style.display = 'block';
+                container.innerHTML = s.frame_results.map(f => {
+                    const rawSrc = f.raw_base64 ? 'data:image/jpeg;base64,' + f.raw_base64 : '';
+                    const annSrc = f.annotated_base64
+                        ? 'data:image/jpeg;base64,' + f.annotated_base64
+                        : (f.s3_url || '');
+                    const s3Link = f.s3_url
+                        ? `<a href="${f.s3_url}" target="_blank" style="color: var(--accent-primary); font-size: 0.75rem; word-break: break-all;">${f.s3_url}</a>`
+                        : '<span style="color: var(--accent-red); font-size: 0.75rem;">Upload failed</span>';
+                    const originalHTML = rawSrc
+                        ? `<img src="${rawSrc}" alt="Frame ${f.position} original">`
+                        : '<div style="padding: 2rem; text-align: center; color: var(--accent-red);">Frame unavailable</div>';
+                    const detectedHTML = annSrc
+                        ? `<img src="${annSrc}" alt="Frame ${f.position} detected">`
+                        : '<div style="padding: 2rem; text-align: center; color: var(--accent-red);">No detection output</div>';
+                    return `
+                        <div style="margin-bottom: 2rem; padding-bottom: 1.5rem; border-bottom: 1px solid var(--border-color);">
+                            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; flex-wrap: wrap; gap: 0.5rem;">
+                                <h4 style="color: var(--text-primary); margin: 0;">
+                                    <i class="fas fa-film" style="color: var(--accent-primary); margin-right: 0.5rem;"></i>
+                                    Frame ${f.position}
+                                    <span style="color: var(--text-secondary); font-weight: 400; font-size: 0.85rem; margin-left: 0.5rem;">
+                                        t = ${f.timestamp}s  •  video frame ${f.frame_index}
+                                    </span>
+                                </h4>
+                                <div style="display: flex; gap: 1rem; align-items: center;">
+                                    <span style="background: rgba(245, 158, 11, 0.15); color: var(--accent-primary); padding: 0.4rem 0.9rem; border-radius: 20px; font-weight: 700;">
+                                        <i class="fas fa-bug"></i> ${f.bee_count} bees
+                                    </span>
+                                </div>
+                            </div>
+                            <div class="image-comparison">
+                                <div class="image-box">
+                                    <h5><i class="fas fa-image"></i> Original</h5>
+                                    <div class="image-wrapper">
+                                        <span class="image-label">ORIGINAL</span>
+                                        ${originalHTML}
+                                    </div>
+                                </div>
+                                <div class="image-box">
+                                    <h5><i class="fas fa-magic"></i> Detected</h5>
+                                    <div class="image-wrapper">
+                                        <span class="image-label">OUTPUT</span>
+                                        ${detectedHTML}
+                                    </div>
+                                </div>
+                            </div>
+                            <div style="margin-top: 0.75rem; font-size: 0.75rem;">
+                                <i class="fas fa-cloud" style="color: var(--accent-green); margin-right: 0.3rem;"></i>
+                                <span style="color: var(--text-secondary);">Detected frame on S3: </span>
+                                ${s3Link}
+                            </div>
+                        </div>`;
+                }).join('');
+            } else {
+                card.style.display = 'none';
+                container.innerHTML = '';
             }
         }
 
         // ===== MICROPHONE RECORDING =====
         function toggleRecording() {
-            if (isRecording) return;
+            // Click #1 starts recording, click #2 stops + analyzes.
+            // Auto-stops at max_duration (20 s) if the user doesn't click Stop first.
+            if (isRecording) {
+                stopRecordingAndAnalyze();
+                return;
+            }
             const btn = document.getElementById('recordBtn');
             btn.disabled = true;
             btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Starting...';
@@ -2794,10 +3204,27 @@ HTML_TEMPLATE = """
                     isRecording = true;
                     btn.classList.add('recording');
                     btn.disabled = false;
-                    btn.innerHTML = '<i class="fas fa-stop"></i> Recording...';
-                    document.getElementById('audioStatus').textContent = 'Recording audio for 3 seconds...';
+                    btn.innerHTML = '<i class="fas fa-stop"></i> Stop & Analyze';
                     startVisualizer();
-                    setTimeout(() => { stopRecordingAndAnalyze(); }, (data.duration || 3) * 1000);
+
+                    const maxDur = data.max_duration || 20;
+                    const startTs = Date.now();
+                    const statusEl = document.getElementById('audioStatus');
+                    statusEl.textContent = `Recording… 0.0 / ${maxDur}s  (tap Stop when done)`;
+
+                    // Live elapsed timer
+                    if (window._recTimer) clearInterval(window._recTimer);
+                    window._recTimer = setInterval(() => {
+                        if (!isRecording) { clearInterval(window._recTimer); window._recTimer = null; return; }
+                        const elapsed = (Date.now() - startTs) / 1000;
+                        statusEl.textContent = `Recording… ${elapsed.toFixed(1)} / ${maxDur}s  (tap Stop when done)`;
+                    }, 100);
+
+                    // Auto-stop at max duration (server also enforces the cap)
+                    if (window._recAutoStop) clearTimeout(window._recAutoStop);
+                    window._recAutoStop = setTimeout(() => {
+                        if (isRecording) stopRecordingAndAnalyze();
+                    }, (maxDur + 0.5) * 1000);
                 })
                 .catch(err => {
                     btn.disabled = false;
@@ -2811,6 +3238,8 @@ HTML_TEMPLATE = """
             btn.disabled = true;
             btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Analyzing...';
             stopVisualizer();
+            if (window._recTimer) { clearInterval(window._recTimer); window._recTimer = null; }
+            if (window._recAutoStop) { clearTimeout(window._recAutoStop); window._recAutoStop = null; }
             document.getElementById('audioStatus').textContent = 'Analyzing with BeeCNN...';
 
             fetch('/analyze-recorded-audio', { method: 'POST' })
@@ -2916,122 +3345,188 @@ HTML_TEMPLATE = """
         }
 
         // ===== CHARTS & DASHBOARD =====
-        function loadCVHistory(canvasId) {
-            fetch('/api/cv-history')
-                .then(r => r.json())
-                .then(data => {
-                    const ctx = document.getElementById(canvasId);
-                    if (!ctx) return;
 
-                    if (data.length === 0) {
-                        ctx.parentElement.innerHTML = '<div class="no-data">No detection data yet. Run some captures!</div>';
-                        return;
-                    }
+        // Format a bucket timestamp for the x-axis. Uses HH:MM for same-day
+        // data, adds MM/DD when the range spans multiple days.
+        function _bucketLabels(data) {
+            if (!data.length) return [];
+            const firstDay = new Date(data[0].timestamp).toDateString();
+            const spansMultipleDays = data.some(d => new Date(d.timestamp).toDateString() !== firstDay);
+            return data.map(d => {
+                const date = new Date(d.timestamp);
+                const hm = date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false });
+                if (!spansMultipleDays) return hm;
+                const md = date.toLocaleDateString('en-US', { month: '2-digit', day: '2-digit' });
+                return `${md}  ${hm}`;
+            });
+        }
 
-                    const labels = data.map(d => {
-                        const date = new Date(d.timestamp);
-                        return date.toLocaleString('en-US', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
-                    });
-                    const counts = data.map(d => d.bee_count);
+        // Shared bar-chart builder used by both CV and audio history.
+        function _renderBucketBar({ canvasId, data, valueKey, color, datasetLabel, emptyMsg, tooltipLabel }) {
+            let host = document.getElementById(canvasId);
+            if (!host) return;
+            if (host.tagName !== 'CANVAS') {
+                host.parentElement.innerHTML = `<canvas id="${canvasId}"></canvas>`;
+                host = document.getElementById(canvasId);
+            }
+            const parent = host.parentElement;
 
-                    const chartKey = 'cvChart_' + canvasId;
-                    if (window[chartKey]) window[chartKey].destroy();
+            if (!data.length) {
+                parent.innerHTML = `<div class="no-data">${emptyMsg}</div>`;
+                return;
+            }
 
-                    window[chartKey] = new Chart(ctx.getContext('2d'), {
-                        type: 'bar',
-                        data: {
-                            labels: labels,
-                            datasets: [{
-                                label: 'Bee Detections',
-                                data: counts,
-                                backgroundColor: '#f59e0b',
-                                borderColor: '#f59e0b',
-                                borderWidth: 1,
-                                borderRadius: 4,
-                                barPercentage: 0.7
-                            }]
+            const labels = _bucketLabels(data);
+            const values = data.map(d => d[valueKey] || 0);
+
+            const chartKey = 'chart_' + canvasId;
+            if (window[chartKey] && typeof window[chartKey].destroy === 'function') {
+                window[chartKey].destroy();
+            }
+            // autoSkip can be useful for wide ranges with many buckets
+            const autoSkip = values.length > 30;
+            const maxTicks = Math.min(values.length, 20);
+
+            window[chartKey] = new Chart(host.getContext('2d'), {
+                type: 'bar',
+                data: {
+                    labels,
+                    datasets: [{
+                        label: datasetLabel,
+                        data: values,
+                        backgroundColor: color,
+                        borderColor: color,
+                        borderWidth: 1,
+                        borderRadius: 4,
+                        barPercentage: 0.85,
+                        categoryPercentage: 0.9
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            grid: { color: '#334155' },
+                            ticks: { color: '#94a3b8', precision: 0 },
+                            title: { display: true, text: 'Bee count', color: '#94a3b8' }
                         },
-                        options: {
-                            responsive: true,
-                            maintainAspectRatio: false,
-                            scales: {
-                                y: {
-                                    beginAtZero: true,
-                                    grid: { color: '#334155' },
-                                    ticks: { color: '#94a3b8' }
-                                },
-                                x: {
-                                    grid: { display: false },
-                                    ticks: { color: '#94a3b8', maxRotation: 45, minRotation: 45, autoSkip: true, maxTicksLimit: 12 }
-                                }
-                            },
-                            plugins: {
-                                legend: {
-                                    labels: { color: '#94a3b8' }
-                                }
+                        x: {
+                            grid: { display: false },
+                            ticks: {
+                                color: '#94a3b8',
+                                maxRotation: 45,
+                                minRotation: 45,
+                                autoSkip,
+                                maxTicksLimit: maxTicks
                             }
                         }
-                    });
-                });
+                    },
+                    plugins: {
+                        legend: { labels: { color: '#94a3b8' } },
+                        tooltip: {
+                            callbacks: {
+                                title: (items) => items[0] ? 'Window start: ' + labels[items[0].dataIndex] : '',
+                                label: (item) => `${tooltipLabel}: ${item.parsed.y}`
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        function loadCVHistory(canvasId, range = 'daily') {
+            fetch(`/api/cv-history?range=${range}`)
+                .then(r => r.json())
+                .then(data => _renderBucketBar({
+                    canvasId, data,
+                    valueKey: 'bee_count',
+                    color: '#f59e0b',
+                    datasetLabel: 'Peak bees per window',
+                    emptyMsg: 'No detection data yet. Run some captures!',
+                    tooltipLabel: 'Peak bees'
+                }));
         }
 
         function loadAudioTrends(range, canvasId) {
             fetch(`/api/audio-history?range=${range}`)
                 .then(r => r.json())
                 .then(data => {
-                    const ctx = document.getElementById(canvasId);
-                    if (!ctx) return;
+                    let host = document.getElementById(canvasId);
+                    if (!host) return;
+                    if (host.tagName !== 'CANVAS') {
+                        host.parentElement.innerHTML = `<canvas id="${canvasId}"></canvas>`;
+                        host = document.getElementById(canvasId);
+                    }
+                    const parent = host.parentElement;
 
-                    if (data.length === 0) {
-                        ctx.parentElement.innerHTML = '<div class="no-data">No audio data yet. Upload or record audio!</div>';
+                    if (!data.length) {
+                        parent.innerHTML = '<div class="no-data">No audio data yet. Upload or record audio!</div>';
                         return;
                     }
 
-                    // If canvas was replaced by no-data, restore it
-                    if (ctx.tagName !== 'CANVAS') {
-                        ctx.parentElement.innerHTML = `<canvas id="${canvasId}"></canvas>`;
+                    const labels = _bucketLabels(data);
+                    const values = data.map(d => d.estimated_count || 0);
+
+                    const chartKey = 'chart_' + canvasId;
+                    if (window[chartKey] && typeof window[chartKey].destroy === 'function') {
+                        window[chartKey].destroy();
                     }
 
-                    const labels = data.map(d => {
-                        const date = new Date(d.timestamp);
-                        return date.toLocaleString('en-US', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
-                    });
-                    const counts = data.map(d => d.estimated_count);
+                    // One label per bucket up to ~20; autoSkip only kicks in for
+                    // longer ranges so the x-axis stays readable.
+                    const autoSkip = values.length > 30;
+                    const maxTicks = Math.min(values.length, 20);
 
-                    const chartKey = 'audioChart_' + canvasId;
-                    if (window[chartKey]) window[chartKey].destroy();
-
-                    window[chartKey] = new Chart(document.getElementById(canvasId).getContext('2d'), {
+                    window[chartKey] = new Chart(host.getContext('2d'), {
                         type: 'line',
                         data: {
-                            labels: labels,
+                            labels,
                             datasets: [{
-                                label: 'Estimated Bee Count',
-                                data: counts,
+                                label: 'Estimated bees per window',
+                                data: values,
                                 borderColor: '#8b5cf6',
-                                backgroundColor: 'rgba(139, 92, 246, 0.1)',
-                                fill: true,
-                                tension: 0.4,
+                                backgroundColor: 'rgba(139, 92, 246, 0.15)',
+                                pointBackgroundColor: '#8b5cf6',
+                                pointBorderColor: '#8b5cf6',
                                 pointRadius: 3,
-                                pointBackgroundColor: '#8b5cf6'
+                                pointHoverRadius: 5,
+                                borderWidth: 2.5,
+                                tension: 0.35,
+                                fill: true,
                             }]
                         },
                         options: {
                             responsive: true,
                             maintainAspectRatio: false,
+                            interaction: { mode: 'index', intersect: false },
                             scales: {
                                 y: {
                                     beginAtZero: true,
                                     grid: { color: '#334155' },
-                                    ticks: { color: '#94a3b8' }
+                                    ticks: { color: '#94a3b8', precision: 0 },
+                                    title: { display: true, text: 'Estimated bee count', color: '#94a3b8' }
                                 },
                                 x: {
-                                    grid: { color: '#334155' },
-                                    ticks: { color: '#94a3b8', maxTicksLimit: 8 }
+                                    grid: { color: 'rgba(51, 65, 85, 0.4)' },
+                                    ticks: {
+                                        color: '#94a3b8',
+                                        maxRotation: 0,
+                                        minRotation: 0,
+                                        autoSkip,
+                                        maxTicksLimit: maxTicks
+                                    }
                                 }
                             },
                             plugins: {
-                                legend: { display: false }
+                                legend: { display: false },
+                                tooltip: {
+                                    callbacks: {
+                                        title: (items) => items[0] ? 'Window start: ' + labels[items[0].dataIndex] : '',
+                                        label: (item) => `Estimated bees: ${item.parsed.y}`
+                                    }
+                                }
                             }
                         }
                     });
@@ -3048,6 +3543,18 @@ HTML_TEMPLATE = """
             btn.parentElement.querySelectorAll('.toggle-btn').forEach(b => b.classList.remove('active'));
             btn.classList.add('active');
             loadAudioTrends(range, 'dashAudioTrendChart');
+        }
+
+        function switchCVRange(range, btn) {
+            btn.parentElement.querySelectorAll('.toggle-btn').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            loadCVHistory('cvHistoryChart', range);
+        }
+
+        function switchDashCVRange(range, btn) {
+            btn.parentElement.querySelectorAll('.toggle-btn').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            loadCVHistory('dashCVHistoryChart', range);
         }
 
         function loadAlerts() {
@@ -3188,6 +3695,179 @@ def video_feed():
     )
 
 
+# ============================================================
+# LIVE DETECTION ROUTES
+# Background thread grabs a frame from the local camera, posts it to the
+# existing Roboflow run_workflow (team-yolo) API, and exposes the latest
+# annotated frame via the /live-feed MJPEG endpoint.
+# ============================================================
+
+
+def _live_capture_loop():
+    """Dedicated capture thread. Reads frames from the camera as fast as the
+    hardware allows and publishes them to `latest_raw_frame`. This keeps the
+    MJPEG feed smooth even while a slow Roboflow API call is in flight."""
+    global latest_raw_frame
+    while live_session is not None and live_session.get("active"):
+        try:
+            frame = capture_frame()
+            if frame is None:
+                time.sleep(0.05)
+                continue
+            with live_session_lock:
+                latest_raw_frame = frame
+            # ~20 FPS target; the camera hardware is the real bottleneck anyway.
+            time.sleep(0.05)
+        except Exception as e:
+            print(f"Live capture error: {e}")
+            time.sleep(0.2)
+
+
+def _live_inference_loop():
+    """Dedicated inference thread. Repeatedly grabs the latest raw frame (from
+    memory, not the camera — no lock contention), sends it to Roboflow, and
+    publishes the annotated result + bee count. Runs as fast as the API allows."""
+    global latest_annotated_frame, latest_live_count
+    iteration = 0
+    LIVE_MAX_WIDTH = 640  # aggressive downscale = faster round-trip
+
+    while live_session is not None and live_session.get("active"):
+        # Snapshot the latest raw frame
+        with live_session_lock:
+            frame = latest_raw_frame.copy() if latest_raw_frame is not None else None
+        if frame is None:
+            time.sleep(0.1)
+            continue
+
+        # Downscale before uploading to Roboflow
+        h, w = frame.shape[:2]
+        if w > LIVE_MAX_WIDTH:
+            scale = LIVE_MAX_WIDTH / float(w)
+            send_frame = cv2.resize(frame, (LIVE_MAX_WIDTH, int(h * scale)))
+        else:
+            send_frame = frame
+
+        temp_path = os.path.join(
+            CAPTURE_FOLDER, f"live_{int(time.time() * 1000)}.jpg"
+        )
+        cv2.imwrite(temp_path, send_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
+        try:
+            result = realtime_client.run_workflow(
+                workspace_name="team-yolo",
+                workflow_id="detect-count-and-visualize-2",
+                images={"image": temp_path},
+                use_cache=True,
+            )
+            data = result[0] if result else {}
+            bee_count = int(data.get("count_objects", 0) or 0)
+            output_b64 = data.get("output_image")
+
+            if output_b64:
+                try:
+                    nparr = np.frombuffer(base64.b64decode(output_b64), np.uint8)
+                    annotated = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                    if annotated is not None:
+                        with live_session_lock:
+                            latest_annotated_frame = annotated
+                except Exception as e:
+                    print(f"Live: failed to decode annotated frame: {e}")
+
+            latest_live_count = bee_count
+
+            # Log every ~10 inferences so the dashboard trend stays live
+            iteration += 1
+            if iteration % 10 == 0:
+                log_cv_detection(bee_count, "live")
+                increment_dashboard_stats(total_detections=bee_count)
+        except Exception as e:
+            print(f"Live inference error: {e}")
+            time.sleep(0.3)
+        finally:
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+    print("Live inference thread exited")
+
+
+@app.route("/start-live-detection", methods=["POST"])
+def start_live_detection():
+    """Start the two-thread live-detection system (capture + inference)."""
+    global live_session, live_capture_thread, live_inference_thread
+    global latest_raw_frame, latest_annotated_frame, latest_live_count
+
+    if live_session is not None:
+        return jsonify({"error": "Live detection already running"}), 400
+
+    if camera is None:
+        if not init_camera():
+            return jsonify({"error": "Camera not available"}), 500
+
+    live_session = {"active": True}
+    with live_session_lock:
+        latest_raw_frame = None
+        latest_annotated_frame = None
+    latest_live_count = 0
+
+    live_capture_thread = threading.Thread(target=_live_capture_loop, daemon=True)
+    live_capture_thread.start()
+    live_inference_thread = threading.Thread(target=_live_inference_loop, daemon=True)
+    live_inference_thread.start()
+
+    add_alert("Live Detection Started", "Real-time Roboflow detection session started", "info")
+    return jsonify({"success": True})
+
+
+@app.route("/stop-live-detection", methods=["POST"])
+def stop_live_detection():
+    """Signal both background threads to exit and clear shared state."""
+    global live_session, latest_raw_frame, latest_annotated_frame, latest_live_count
+    if live_session is None:
+        return jsonify({"error": "No live session running"}), 400
+    live_session["active"] = False
+    live_session = None
+    with live_session_lock:
+        latest_raw_frame = None
+        latest_annotated_frame = None
+    latest_live_count = 0
+    add_alert("Live Detection Stopped", "Real-time detection session stopped", "info")
+    return jsonify({"success": True})
+
+
+@app.route("/live-feed")
+def live_feed():
+    """MJPEG stream: prefers the latest annotated frame, falls back to the
+    latest raw frame so the browser always sees current video even during
+    long Roboflow round-trips."""
+    def gen():
+        while True:
+            if live_session is None:
+                break
+            with live_session_lock:
+                frame = latest_annotated_frame if latest_annotated_frame is not None else latest_raw_frame
+            if frame is not None:
+                ok, buffer = cv2.imencode(".jpg", frame)
+                if ok:
+                    yield (
+                        b"--frame\r\n"
+                        b"Content-Type: image/jpeg\r\n\r\n"
+                        + buffer.tobytes()
+                        + b"\r\n"
+                    )
+            time.sleep(0.05)  # ~20 FPS UI refresh
+    return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+
+@app.route("/live-count", methods=["GET"])
+def live_count():
+    """Polled by the browser to display the real-time bee count."""
+    return jsonify({
+        "count_objects": int(latest_live_count),
+        "active": live_session is not None,
+    })
+
+
 @app.route("/capture-and-detect", methods=["POST"])
 def capture_and_detect():
     """Capture a frame from camera and run detection"""
@@ -3207,8 +3887,8 @@ def capture_and_detect():
 
     try:
         start_time = time.time()
-        result = client.run_workflow(
-            workspace_name="asad-fnvcs",
+        result = realtime_client.run_workflow(
+            workspace_name="team-yolo",
             workflow_id="detect-count-and-visualize-2",
             images={"image": capture_path},
             use_cache=True
@@ -3273,8 +3953,8 @@ def capture_burst():
 
         try:
             start_time = time.time()
-            result = client.run_workflow(
-                workspace_name="asad-fnvcs",
+            result = realtime_client.run_workflow(
+                workspace_name="team-yolo",
                 workflow_id="detect-count-and-visualize-2",
                 images={"image": capture_path},
                 use_cache=True
@@ -3363,49 +4043,52 @@ audio_recording_path = None
 
 @app.route("/record-audio", methods=["POST"])
 def start_audio_recording():
-    """Start recording audio from microphone"""
+    """Start a user-stoppable audio recording (hard-capped at 20 s).
+    The frontend calls /analyze-recorded-audio to stop + analyze."""
     global audio_recording_path
-
     try:
         timestamp = int(time.time())
         filename = f"audio_capture_{timestamp}.wav"
         audio_recording_path = os.path.join(AUDIO_UPLOAD_FOLDER, filename)
 
-        def record():
-            record_audio_jetson(duration=AUDIO_DURATION, output_path=audio_recording_path)
+        if not start_recording(audio_recording_path, max_duration=AUDIO_MAX_DURATION):
+            return jsonify({"error": "Already recording"}), 400
 
-        thread = threading.Thread(target=record)
-        thread.start()
-
-        return jsonify({"success": True, "duration": AUDIO_DURATION, "filename": filename})
+        return jsonify({
+            "success": True,
+            "max_duration": AUDIO_MAX_DURATION,
+            "filename": filename,
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/analyze-recorded-audio", methods=["POST"])
 def analyze_recorded_audio():
-    """Analyze the recorded audio with BeeCNN"""
+    """Stop the active recording (if any), then run BeeCNN on the resulting WAV.
+    Works for recordings of any length between ~1 s and AUDIO_MAX_DURATION s."""
     global audio_recording_path
+
+    # If the user has been recording, stop the worker and wait for the WAV to flush
+    stop_recording()
 
     if audio_recording_path is None or not os.path.exists(audio_recording_path):
         return jsonify({"error": "No recording found"}), 400
 
     try:
-        # Audio clips are NOT uploaded to S3 — only analysis results are persisted.
         result = predict_audio(audio_recording_path)
         result["filename"] = os.path.basename(audio_recording_path)
 
-        # Log analysis result to history (stored on S3)
         log_audio_analysis(result)
         increment_dashboard_stats(audio_samples=1)
 
         os.remove(audio_recording_path)
         audio_recording_path = None
-
         return jsonify(result)
     except Exception as e:
         if audio_recording_path and os.path.exists(audio_recording_path):
-            os.remove(audio_recording_path)
+            try: os.remove(audio_recording_path)
+            except OSError: pass
             audio_recording_path = None
         return jsonify({"error": str(e)}), 500
 
@@ -3433,56 +4116,37 @@ def upload_video():
     file.save(input_path)
 
     try:
-        # Process video
-        output_path, summary = process_video_file(input_path, frame_interval=5)
+        # Split the video into 5 frames, run each through Roboflow,
+        # upload ONLY the annotated frames to S3. Raw video is NOT uploaded.
+        summary, err = process_video_file(input_path)
+        if summary is None:
+            return jsonify({"error": err or "Video processing failed"}), 500
 
-        if output_path is None:
-            return jsonify({"error": summary}), 500
-
-        # Log video detections
+        # Log video detections + dashboard stats
         log_cv_detection(summary.get("max_bees_in_single_frame", 0), "video")
         increment_dashboard_stats(
             videos_processed=1,
-            total_detections=int(summary.get("total_bees_detected", 0) or 0)
+            total_detections=int(summary.get("total_bees_detected", 0) or 0),
         )
         if summary.get("total_bees_detected", 0) > 200:
-            add_alert("High Video Activity", f"Video peak: {summary.get('max_bees_in_single_frame', 0)} bees", "warning")
+            add_alert(
+                "High Video Activity",
+                f"Video peak: {summary.get('max_bees_in_single_frame', 0)} bees",
+                "warning",
+            )
 
-        # Read output video as base64 for frontend playback
-        output_base64 = None
-        if os.path.exists(output_path):
-            with open(output_path, "rb") as f:
-                output_base64 = base64.b64encode(f.read()).decode('utf-8')
-
-        # Upload original and processed to S3
-        s3_input_url = upload_to_s3(input_path, filename, folder="video/input")
-        s3_output_url = None
-        if output_path and os.path.exists(output_path):
-            out_filename = os.path.basename(output_path)
-            s3_output_url = upload_to_s3(output_path, out_filename, folder="video/output")
-
-        response = {
-            "success": True,
-            "summary": summary,
-            "s3_input_url": s3_input_url,
-            "s3_output_url": s3_output_url
-        }
-
-        if output_base64:
-            response["output_video_base64"] = output_base64
-
-        return jsonify(response)
+        return jsonify({"success": True, "summary": summary})
 
     except Exception as e:
         print(f"Video processing error: {e}")
         return jsonify({"error": str(e)}), 500
     finally:
+        # Raw uploaded video is discarded locally — nothing to upload to S3.
         if os.path.exists(input_path):
-            os.remove(input_path)
-        # Clean up output file after sending
-        output_path = os.path.join(VIDEO_UPLOAD_FOLDER, f"output_{timestamp}.mp4")
-        if os.path.exists(output_path):
-            os.remove(output_path)
+            try:
+                os.remove(input_path)
+            except OSError:
+                pass
 
 # ============================================================
 # IMAGE UPLOAD & DETECTION ROUTE
@@ -3589,26 +4253,68 @@ def upload_image():
 # DASHBOARD API ROUTES
 # ============================================================
 
+# ---------- range-based bucketed aggregation helper ----------
+# Each range uses a bucket size that yields a clean, readable chart:
+#   daily   →   10-minute buckets, covers last 24 hours (~144 buckets max)
+#   weekly  →    1-hour  buckets, covers last 7 days    (~168 buckets max)
+#   monthly →    6-hour  buckets, covers last 30 days   (~120 buckets max)
+_RANGE_SPEC = {
+    "daily":   {"window": timedelta(days=1),   "bucket": timedelta(minutes=10)},
+    "weekly":  {"window": timedelta(weeks=1),  "bucket": timedelta(hours=1)},
+    "monthly": {"window": timedelta(days=30),  "bucket": timedelta(hours=6)},
+}
+
+def _floor_to_bucket(ts, bucket_size):
+    """Round `ts` down to the nearest multiple of `bucket_size` (assumes
+    bucket_size divides 24h cleanly — all three sizes above do)."""
+    secs = int(bucket_size.total_seconds())
+    epoch = ts.replace(hour=0, minute=0, second=0, microsecond=0)
+    offset = int((ts - epoch).total_seconds())
+    floored = (offset // secs) * secs
+    return epoch + timedelta(seconds=floored)
+
+
+def _bucketize(history, range_type, value_key):
+    """Aggregate `history` entries (list of dicts with 'timestamp' + value_key)
+    into time buckets sized by `range_type`. Keeps the MAX value per bucket
+    (e.g. peak bee count in that 10-min / 1-h / 6-h window) and returns a
+    sorted list of dicts of the form:
+        {"timestamp": iso, "<value_key>": int}
+    """
+    spec = _RANGE_SPEC.get(range_type, _RANGE_SPEC["daily"])
+    cutoff = datetime.now() - spec["window"]
+    buckets = {}
+    for entry in history:
+        try:
+            ts = datetime.fromisoformat(entry["timestamp"])
+        except Exception:
+            continue
+        if ts < cutoff:
+            continue
+        bucket_ts = _floor_to_bucket(ts, spec["bucket"])
+        key = bucket_ts.isoformat()
+        val = int(entry.get(value_key, 0) or 0)
+        if key not in buckets or val > buckets[key][value_key]:
+            buckets[key] = {"timestamp": key, value_key: val}
+    return sorted(buckets.values(), key=lambda r: r["timestamp"])
+
+
 @app.route("/api/cv-history", methods=["GET"])
 def get_cv_history():
-    history = load_json_from_s3(HISTORY_S3_KEY)
-    return jsonify(history[-50:])  # Last 50 entries
+    """Aggregated CV history with daily/weekly/monthly range support.
+    Returns peak bee_count per bucket so the bar chart reads cleanly."""
+    range_type = request.args.get("range", "daily")
+    history = load_json_from_s3(HISTORY_S3_KEY) or []
+    return jsonify(_bucketize(history, range_type, "bee_count"))
+
 
 @app.route("/api/audio-history", methods=["GET"])
 def get_audio_history():
+    """Aggregated audio history with daily/weekly/monthly range support.
+    Returns peak estimated_count per bucket so the bar chart matches CV."""
     range_type = request.args.get("range", "daily")
-    history = load_json_from_s3(AUDIO_HISTORY_S3_KEY)
-
-    now = datetime.now()
-    if range_type == "daily":
-        cutoff = now - timedelta(days=1)
-    elif range_type == "weekly":
-        cutoff = now - timedelta(weeks=1)
-    else:  # monthly
-        cutoff = now - timedelta(days=30)
-
-    filtered = [h for h in history if datetime.fromisoformat(h["timestamp"]) > cutoff]
-    return jsonify(filtered)
+    history = load_json_from_s3(AUDIO_HISTORY_S3_KEY) or []
+    return jsonify(_bucketize(history, range_type, "estimated_count"))
 
 @app.route("/api/alerts", methods=["GET"])
 def get_alerts():
@@ -3619,6 +4325,17 @@ def get_alerts():
 def get_dashboard_stats():
     """Return cumulative dashboard counters stored on S3."""
     return jsonify(load_dashboard_stats())
+
+
+@app.route("/api/clear-history", methods=["POST"])
+def clear_history():
+    """Wipe the detection history, audio history, and dashboard counters on S3.
+    Alerts are left intact so the startup 'Device Online' trail is preserved.
+    Useful for cleaning up data accumulated during a prior auto-start session."""
+    save_json_to_s3(HISTORY_S3_KEY, [])
+    save_json_to_s3(AUDIO_HISTORY_S3_KEY, [])
+    save_json_to_s3(DASHBOARD_STATS_S3_KEY, dict(DEFAULT_DASHBOARD_STATS))
+    return jsonify({"success": True, "message": "History and dashboard stats cleared."})
 
 
 # ============================================================
@@ -3654,6 +4371,8 @@ if __name__ == "__main__":
     init_test_data()
 
     try:
-        app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
+        # Bind to loopback only — avoids double-binding on all LAN interfaces
+        # which was noticeably slowing request handling.
+        app.run(host='127.0.0.1', port=5000, debug=False, threaded=True)
     finally:
         cleanup()
