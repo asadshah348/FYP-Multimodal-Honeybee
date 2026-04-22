@@ -1,0 +1,8 @@
+timestamp,filename,label,rms,band_energy
+2026-04-20 21:50:04,tryaud1.wav,Recording 1,0.063121,0.044212
+2026-04-20 21:53:37,tryaud1.wav,tryaud1.wav,0.063121,0.044212
+2026-04-20 21:53:38,tryaud2.wav,tryaud2.wav,0.059639,0.040902
+2026-04-20 21:53:38,tryaud3.wav,tryaud3.wav,0.057323,0.039921
+2026-04-20 22:02:40,tryaud1.wav,tryaud1.wav,0.063121,0.044212
+2026-04-20 22:02:40,tryaud2.wav,tryaud2.wav,0.059639,0.040902
+2026-04-20 22:02:40,tryaud3.wav,tryaud3.wav,0.057323,0.039921
