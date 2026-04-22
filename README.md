@@ -1,4 +1,4 @@
-# Multimodal Honeybee Hive Monitoring System
+# Multimodal Honeybee Population Estimation System Using Computer Vision and Audio Analysis
 
 > **Final Year Project — Ghulam Ishaq Khan Institute of Engineering Sciences and Technology (GIKI)**  
 > Team of 3 · 2025–2026
